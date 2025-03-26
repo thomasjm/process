@@ -20,7 +20,6 @@ module System.Process.Windows
     , timeout_Infinite
     ) where
 
-import System.Process.Common
 import Control.Concurrent
 import Control.Exception
 import Control.Monad
@@ -31,6 +30,7 @@ import Foreign.Marshal
 import Foreign.Ptr
 import Foreign.Storable
 import System.IO.Unsafe
+import System.Process.Common
 
 import System.Posix.Internals
 import GHC.IO.Exception
@@ -419,18 +419,9 @@ commandToProcess
   -> IO (FilePath, String)
 commandToProcess (ShellCommand string) = do
   cmd <- findCommandInterpreter
-  return (cmd, translateInternal cmd ++ " /c " ++ string)
-        -- We don't want to put the cmd into a single
-        -- argument, because cmd.exe will not try to split it up.  Instead,
-        -- we just tack the command on the end of the cmd.exe command line,
-        -- which partly works.  There seem to be some quoting issues, but
-        -- I don't have the energy to find+fix them right now (ToDo). --SDM
-        -- (later) Now I don't know what the above comment means.  sigh.
-commandToProcess (RawCommand cmd args)
-  | map toLower (takeExtension cmd) `elem` [".bat", ".cmd"]
-  = return (cmd, translateInternal cmd ++ concatMap ((' ':) . translateCmdExeArg) args)
-  | otherwise
-  = return (cmd, translateInternal cmd ++ concatMap ((' ':) . translateInternal) args)
+  return (cmd, escapeCreateProcessArg0 cmd ++ " /c " ++ string)
+commandToProcess (RawCommand cmd args) = do
+  return (cmd, escapeCreateProcessArg0 cmd ++ concatMap ((' ':) . escapeCreateProcessArg) args)
 
 -- Find CMD.EXE (or COMMAND.COM on Win98).  We use the same algorithm as
 -- system() in the VC++ CRT (Vc7/crt/src/system.c in a VC++ installation).
@@ -471,41 +462,70 @@ findCommandInterpreter = do
                                 "findCommandInterpreter" Nothing Nothing)
       Just cmd -> return cmd
 
--- | Alternative regime used to escape arguments destined for scripts
--- interpreted by @cmd.exe@, (e.g. @.bat@ and @.cmd@ files).
+-- | Escape the *first* argument for Windows CreateProcess.
+-- For subsequent arguments, see 'escapeCreateProcessArg'.
 --
--- This respects the Windows command interpreter's quoting rules:
+-- The first argument is parsed differently than subsequent arguments. It must be a valid
+-- Windows path. To ensure it's escaped properly, we do two things:
+-- a) Strip out quotes from the path, since quotes are forbidden in Windows paths
+--    (see https://stackoverflow.com/a/31976060)
+-- b) If the resulting string contains any whitespace, wrap it in double quotes. Otherwise,
+--    leave it as-is.
 --
--- * the entire argument should be surrounded in quotes
--- * the backslash symbol is used to escape quotes and backslashes
--- * the carat symbol is used to escape other special characters with
---   significance to the interpreter
+-- The QuickCheck tests that verify the correctness of this can be found in a separate repo:
+-- https://github.com/thomasjm/process-escape-windows
+-- This code was copied from commit 07c9ce7a062fb2977ddd26b1da07848cc8ced2f5 of that repo.
+escapeCreateProcessArg0 :: String -> String
+escapeCreateProcessArg0 exe
+  | not (hasWhitespace exe) = exeWithoutForbiddenChars
+  | otherwise = "\"" ++ exeWithoutForbiddenChars ++ "\""
+  where
+    exeWithoutForbiddenChars = filter (not . (== '"')) exe
+
+    hasWhitespace = any (`elem` " \t")
+
+-- | Escape a single argument for Windows CreateProcess.
+-- (Not the first argument! For argv[0], see 'escapeCreateProcessArg0'.)
 --
--- It is particularly important that we perform this quoting as
--- unvalidated unquoted command-line arguments can be used to achieve
--- arbitrary user code execution in when passed to a vulnerable batch
--- script.
+-- This follows the escaping rules described in Microsoft's documentation:
+-- https://docs.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-commandlinetoargvw
 --
-translateCmdExeArg :: String -> String
-translateCmdExeArg xs = "^\"" ++ snd (foldr escape (True,"^\"") xs)
-  where escape '"'  (_,     str) = (True,  '\\' : '"'  : str)
-        escape '\\' (True,  str) = (True,  '\\' : '\\' : str)
-        escape '\\' (False, str) = (False, '\\' : str)
-        escape c    (_,     str)
-          | c `elem` "^<>|&()"   = (False, '^' : c : str)
-          | otherwise            = (False,       c : str)
+-- The QuickCheck tests that verify the correctness of this can be found in a separate repo:
+-- https://github.com/thomasjm/process-escape-windows
+-- This code was copied from commit 07c9ce7a062fb2977ddd26b1da07848cc8ced2f5 of that repo.
+escapeCreateProcessArg :: String -> String
+escapeCreateProcessArg arg
+  | not (needsQuoting arg) = arg
+  | otherwise = "\"" ++ escape arg True ++ "\""
+  where
+    -- Check if an argument needs quoting
+    needsQuoting :: String -> Bool
+    needsQuoting s = null s || any (`elem` specialChars) s
+
+    specialChars :: [Char]
+    specialChars = [' ', '\t', '"', '\'', '(', ')', '<', '>', '&', '|', '^', '%']
+
+    -- Escape the string, with a flag indicating if we're at the end
+    -- (meaning the next character would be the closing quote)
+    escape :: String -> Bool -> String
+    escape [] _ = []
+    escape ('"':xs) endsWithQuote = "\\\"" ++ escape xs endsWithQuote
+    escape xs endsWithQuote =
+      let (backslashes, rest) = span (== '\\') xs
+          bsCount = length backslashes
+      in case rest of
+          -- If backslashes are followed by a quote, they need to be doubled plus one
+          '"':rest' -> replicate (2 * bsCount + 1) '\\' ++ "\"" ++ escape rest' endsWithQuote
+
+          -- If we're at the end of the string, backslashes need to be doubled
+          [] | endsWithQuote -> replicate (2 * bsCount) '\\'
+
+          -- Otherwise, backslashes remain as is
+          [] -> replicate bsCount '\\'
+          (c:cs) -> replicate bsCount '\\' ++ c : escape cs endsWithQuote
 
 translateInternal :: String -> String
-translateInternal xs = '"' : snd (foldr escape (True,"\"") xs)
-  where escape '"'  (_,     str) = (True,  '\\' : '"'  : str)
-        escape '\\' (True,  str) = (True,  '\\' : '\\' : str)
-        escape '\\' (False, str) = (False, '\\' : str)
-        escape c    (_,     str) = (False, c : str)
-        -- See long comment above for what this function is trying to do.
-        --
-        -- The Bool passed back along the string is True iff the
-        -- rest of the string is a sequence of backslashes followed by
-        -- a double quote.
+translateInternal = escapeCreateProcessArg
 
 withCEnvironment :: [(String,String)] -> (Ptr CWString -> IO a) -> IO a
 withCEnvironment envir act =
